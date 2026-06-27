@@ -1,0 +1,1307 @@
+-- Fluent UI Setup
+local Fluent, SaveManager, InterfaceManager
+
+local task = type(task) == "table" and task or {}
+if type(task.wait) ~= "function" then
+    task.wait = wait
+end
+if type(task.spawn) ~= "function" then
+    task.spawn = function(callback, ...)
+    local args = { ... }
+    return spawn(function()
+        callback(unpack(args))
+    end)
+    end
+end
+if type(task.delay) ~= "function" then
+    task.delay = function(delayTime, callback, ...)
+    local args = { ... }
+    return spawn(function()
+        wait(delayTime)
+        callback(unpack(args))
+    end)
+    end
+end
+
+local function getLoader()
+    if type(loadstring) == "function" then
+        return loadstring
+    end
+    if type(load) == "function" then
+        return load
+    end
+    return nil
+end
+
+local function httpGet(url)
+    local ok, result = pcall(function()
+        return game:HttpGet(url, true)
+    end)
+    if ok and type(result) == "string" and result ~= "" then
+        return true, result
+    end
+
+    local synTable = rawget(_G, "syn")
+    local fluxusTable = rawget(_G, "fluxus")
+    local requestImpl = rawget(_G, "request")
+        or rawget(_G, "http_request")
+        or rawget(_G, "http")
+        or rawget(_G, "requestfunc")
+        or (type(synTable) == "table" and synTable.request)
+        or (type(fluxusTable) == "table" and fluxusTable.request)
+
+    if type(requestImpl) ~= "function" then
+        return false, result
+    end
+
+    local requestOk, response = pcall(requestImpl, {
+        Url = url,
+        Method = "GET",
+    })
+
+    if not requestOk or type(response) ~= "table" then
+        return false, response
+    end
+
+    local body = response.Body or response.body
+    return type(body) == "string" and body ~= "", body or response.StatusMessage or "empty response"
+end
+
+local function loadRemoteModule(url, label)
+    local loader = getLoader()
+    if type(loader) ~= "function" then
+        return nil, "loadstring/load is not available"
+    end
+
+    local fetchOk, source = httpGet(url)
+
+    if not fetchOk or type(source) ~= "string" or source == "" then
+        return nil, "download failed: " .. tostring(source)
+    end
+
+    local chunk, compileErr = loader(source)
+    if type(chunk) ~= "function" then
+        return nil, "compile failed: " .. tostring(compileErr)
+    end
+
+    local runOk, result = pcall(chunk)
+    if not runOk then
+        return nil, "runtime failed: " .. tostring(result)
+    end
+
+    if result == nil then
+        return nil, label .. " returned nil"
+    end
+
+    return result
+end
+
+local uiSuccess, uiErr = pcall(function()
+    local factory = rawget(_G, "__MangoHubUIFactory")
+    if not factory then
+        factory, uiErr = loadRemoteModule("https://raw.githubusercontent.com/linkoro57/Mango_Hub/main/mango-ui", "MangoUI")
+    end
+    if not factory then error(uiErr) end
+    Fluent = factory.Fluent
+    SaveManager = factory.SaveManager
+    InterfaceManager = factory.InterfaceManager
+end)
+
+if not uiSuccess or not Fluent then
+    warn("[Mango Hub] Failed to load Mango UI: " .. tostring(uiErr))
+    return
+end
+
+local RS = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local LP = Players.LocalPlayer
+local fireClickDetector = type(fireclickdetector) == "function" and fireclickdetector or nil
+
+local function req(path)
+    local ok, module = pcall(require, path)
+    return ok and module or nil
+end
+
+local Tycoon = req(RS.Modules.Tycoon.Tycoon)
+local TycoonBalances = req(RS.Modules.Tycoon.Component.TycoonBalances)
+local ClientTycoonBalances = req(RS.Modules.Tycoon.Component.Client.ClientTycoonBalances)
+local ClientTycoonRebirth = req(RS.Modules.Tycoon.Component.Client.ClientTycoonRebirth)
+local ClientTycoonAscension = req(RS.Modules.Tycoon.Component.Client.ClientTycoonAscension)
+local ClientTycoonEvolution = req(RS.Modules.Tycoon.Component.Client.ClientTycoonEvolution)
+local ClientTycoonPowers = req(RS.Modules.Tycoon.Component.Client.ClientTycoonPowers)
+local ClientTycoonPhoneOffers = req(RS.Modules.Tycoon.Component.Client.ClientTycoonPhoneOffers)
+local RemoteSignal = req(RS.Core.RemoteSignal)
+local RemoteRequest = req(RS.Core.RemoteRequest)
+local Entity = req(RS.Core.Entity)
+local Huge = req(RS.Modules.Huge)
+local Config = req(RS.Config)
+
+local state = {
+    AutoBuy = false,
+    AutoUpgradeEarners = false,
+    AutoUpgradePowers = false,
+    AutoWake = false,
+    AutoCashDrop = false,
+    AutoPhone = false,
+    AutoFruit = false,
+    AutoRebirth = false,
+    AutoEvolve = false,
+    AutoAscend = false,
+    AntiAFK = false,
+    SpeedOn = false,
+    SpeedVal = 16,
+}
+local scriptAlive = true
+
+local cacheRoot, buyCache, earnerCache = nil, {}, {}
+local fruitCache, savedCFrame = {}, nil
+local phoneCooldown = 0
+local status = {
+    cash = "--",
+    investors = "--",
+    rebirths = "--",
+    evolve = "--",
+    actions = "idle",
+}
+
+local function getTycoon()
+    return Tycoon and Tycoon.getLocal()
+end
+
+local function afford(price, current)
+    local ok, result = pcall(function()
+        return price ~= nil and price <= current
+    end)
+    return ok and result
+end
+
+local function refreshCaches(tycoon)
+    if not tycoon or not tycoon.Instance then
+        return
+    end
+
+    if cacheRoot == tycoon.Instance and #buyCache > 0 then
+        return
+    end
+
+    cacheRoot, buyCache, earnerCache = tycoon.Instance, {}, {}
+
+    for _, instance in CollectionService:GetTagged("Tycoon.Purchase") do
+        if instance:IsDescendantOf(cacheRoot) then
+            table.insert(buyCache, instance)
+        end
+    end
+
+    for _, instance in CollectionService:GetTagged("Tycoon.Earner") do
+        if instance:IsDescendantOf(cacheRoot) then
+            table.insert(earnerCache, instance)
+        end
+    end
+end
+
+local function doAutoBuy(tycoon)
+    local balances = tycoon:GetComponent(TycoonBalances)
+    if not balances then
+        return
+    end
+
+    for _, instance in buyCache do
+        if not state.AutoBuy then
+            return
+        end
+
+        if instance:GetAttribute("Shown") and not instance:GetAttribute("Purchased") then
+            local entity = Entity.getUnsafe(instance)
+            if entity and not entity.Special then
+                local okPrice, price = pcall(function()
+                    return entity:GetPrice()
+                end)
+
+                if okPrice and afford(price, balances:GetCash()) then
+                    pcall(function()
+                        entity:TryPurchaseAsync(false)
+                    end)
+                end
+            end
+        end
+    end
+end
+
+local function doUpgradeEarners(tycoon)
+    local balances = tycoon:GetComponent(TycoonBalances)
+    if not balances then
+        return
+    end
+
+    for _, instance in earnerCache do
+        if not state.AutoUpgradeEarners then
+            return
+        end
+
+        local entity = Entity.getUnsafe(instance)
+        if entity then
+            local okLevel, level = pcall(function()
+                return entity:GetUpgradeLevel()
+            end)
+
+            if okLevel then
+                local okUpgrade, _, count = pcall(function()
+                    return entity:GetUpgradePrice(level, math.huge, balances:GetCash())
+                end)
+
+                if okUpgrade and count and count > 0 then
+                    pcall(function()
+                        entity:UpgradeAsync(count)
+                    end)
+                end
+            end
+        end
+    end
+end
+
+local function doUpgradePowers(tycoon)
+    local balances = tycoon:GetComponent(ClientTycoonBalances)
+    if not balances then
+        return
+    end
+
+    local powers = tycoon:GetComponent(ClientTycoonPowers)
+    if not (powers and Config) then
+        return
+    end
+
+    for name in pairs(Config.Powers) do
+        if not state.AutoUpgradePowers then
+            return
+        end
+
+        local okLevel, level = pcall(function()
+            return powers:GetLevel(name)
+        end)
+        local okMax, maxLevel = pcall(function()
+            return powers:GetMaxLevel(name)
+        end)
+
+        if okLevel and okMax and maxLevel and level < maxLevel then
+            local okPrice, price = pcall(function()
+                return powers:GetUpgradePrice(name)
+            end)
+            local okInvestors, investors = pcall(function()
+                return balances:GetInvestors()
+            end)
+
+            if okPrice and price and okInvestors and afford(price, investors) then
+                pcall(function()
+                    powers:UpgradeAsync(name)
+                end)
+            end
+        end
+    end
+end
+
+local function doWake()
+    for _, instance in earnerCache do
+        if not state.AutoWake then
+            return
+        end
+
+        local entity = Entity.getUnsafe(instance)
+        if entity and entity.WakeAsync then
+            pcall(function()
+                entity:WakeAsync()
+            end)
+        end
+    end
+end
+
+local function doPhone(tycoon)
+    if os.clock() < phoneCooldown then
+        return
+    end
+
+    local offers = tycoon:GetComponent(ClientTycoonPhoneOffers)
+    if not offers then
+        return
+    end
+
+    local okOffer, offer = pcall(function()
+        return offers:GetCurrentOffer()
+    end)
+
+    if okOffer and type(offer) == "number" then
+        pcall(function()
+            offers:AcceptOffer()
+        end)
+        phoneCooldown = os.clock() + 1.5
+    end
+end
+
+local function tryRebirth(tycoon)
+    local rebirth = tycoon:GetComponent(ClientTycoonRebirth)
+    if not rebirth then
+        return
+    end
+
+    local okPotential, potential = pcall(function()
+        return rebirth:GetPotentialInvestors()
+    end)
+    if not okPotential then
+        return
+    end
+
+    local okReady, ready = pcall(function()
+        return Huge.one < potential
+    end)
+
+    if okReady and ready then
+        pcall(function()
+            rebirth:RebirthAsync(false)
+        end)
+    end
+end
+
+local function tryEvolve(tycoon)
+    local evolution = tycoon:GetComponent(ClientTycoonEvolution)
+    if not evolution then
+        return
+    end
+
+    local okProgress, progress = pcall(function()
+        return evolution:GetEvolutionProgress()
+    end)
+
+    if okProgress and type(progress) == "number" and progress >= 1 then
+        pcall(function()
+            evolution:EvolveAsync()
+        end)
+    end
+end
+
+local function tryAscend(tycoon)
+    local ascension = tycoon:GetComponent(ClientTycoonAscension)
+    if not ascension then
+        return
+    end
+
+    local okDiscovered, discovered = pcall(function()
+        return ascension:IsDiscovered()
+    end)
+    if not (okDiscovered and discovered) then
+        return
+    end
+
+    local okAscension, progress = pcall(function()
+        return ascension:GetAscension()
+    end)
+
+    if okAscension and type(progress) == "number" and progress >= 1 then
+        pcall(function()
+            ascension:AscendAsync()
+        end)
+    end
+end
+
+local function gatherFruit()
+    fruitCache = {}
+    local localTycoon = getTycoon() and getTycoon().Instance
+
+    for _, descendant in workspace:GetDescendants() do
+        if descendant:IsA("BasePart") and descendant.Name == "ClickPart" and descendant.Parent and descendant.Parent.Name == "Fruit" then
+            local ancestor = descendant
+            while ancestor.Parent and ancestor.Parent ~= workspace do
+                ancestor = ancestor.Parent
+            end
+
+            local mine = ancestor.Name == "LemonTree" or (localTycoon and descendant:IsDescendantOf(localTycoon))
+            if mine then
+                local detector = descendant:FindFirstChildOfClass("ClickDetector")
+                if detector then
+                    table.insert(fruitCache, { part = descendant, cd = detector })
+                end
+            end
+        end
+    end
+end
+
+do
+    local okRedeem, redeem = pcall(function()
+        return RemoteRequest.new("CashDropService.Redeem")
+    end)
+    local okSignal, newSignal = pcall(function()
+        return RemoteSignal.new("CashDropService.New")
+    end)
+
+    if okRedeem and okSignal and redeem and newSignal then
+        newSignal.OnClientEvent:Connect(function(id)
+            if state.AutoCashDrop and id ~= nil then
+                pcall(function()
+                    redeem:InvokeServer(id)
+                end)
+            end
+        end)
+    end
+end
+
+do
+    local virtualUser = game:GetService("VirtualUser")
+    LP.Idled:Connect(function()
+        if state.AntiAFK then
+            pcall(function()
+                virtualUser:CaptureController()
+                virtualUser:ClickButton2(Vector2.new())
+            end)
+        end
+    end)
+end
+
+RunService.Heartbeat:Connect(function()
+    if not scriptAlive then
+        return
+    end
+    if state.SpeedOn then
+        local character = LP.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if humanoid and humanoid.WalkSpeed ~= state.SpeedVal then
+            humanoid.WalkSpeed = state.SpeedVal
+        end
+    end
+end)
+
+task.spawn(function()
+    local index = 1
+
+    while scriptAlive do
+        if state.AutoFruit then
+            local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+            if not savedCFrame and hrp then
+                savedCFrame = hrp.CFrame
+                gatherFruit()
+                index = 1
+            end
+
+            if hrp and #fruitCache > 0 then
+                local fruit = fruitCache[index]
+                if fruit and fruit.part and fruit.part.Parent then
+                    hrp.CFrame = CFrame.new(fruit.part.Position + Vector3.new(0, 4, 0))
+                    task.wait(0.1)
+
+                    local origin = hrp.Position
+                    for _, candidate in fruitCache do
+                        if candidate.part and candidate.part.Parent and (candidate.part.Position - origin).Magnitude <= candidate.cd.MaxActivationDistance then
+                            if fireClickDetector then
+                                pcall(function()
+                                    fireClickDetector(candidate.cd)
+                                end)
+                            end
+                        end
+                    end
+                end
+
+                index = index + 8
+                if index > #fruitCache then
+                    index = 1
+                end
+            end
+
+            task.wait(0.05)
+        else
+            if savedCFrame then
+                local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    pcall(function()
+                        hrp.CFrame = savedCFrame
+                    end)
+                end
+                savedCFrame = nil
+            end
+
+            task.wait(0.2)
+        end
+    end
+end)
+
+local updateUi = function() end
+
+local function startLogicLoop()
+    task.spawn(function()
+        while scriptAlive do
+            local tycoon = getTycoon()
+            if tycoon then
+                refreshCaches(tycoon)
+                pcall(function()
+                    local balances = tycoon:GetComponent(ClientTycoonBalances) or tycoon:GetComponent(TycoonBalances)
+                    if balances then
+                        pcall(function()
+                            status.cash = Huge.formatShort(balances:GetCash())
+                        end)
+                        pcall(function()
+                            status.investors = Huge.formatShort(balances:GetInvestors())
+                        end)
+                    end
+
+                    local rebirth = tycoon:GetComponent(ClientTycoonRebirth)
+                    if rebirth then
+                        pcall(function()
+                            status.rebirths = tostring(rebirth:GetRebirths())
+                        end)
+                    end
+
+                    local evolution = tycoon:GetComponent(ClientTycoonEvolution)
+                    if evolution then
+                        pcall(function()
+                            status.evolve = string.format("%.0f%%", math.clamp(evolution:GetEvolutionProgress() * 100, 0, 100))
+                        end)
+                    end
+
+                    local actions = {}
+                    if state.AutoBuy then
+                        doAutoBuy(tycoon)
+                        table.insert(actions, "buy")
+                    end
+                    if state.AutoUpgradeEarners then
+                        doUpgradeEarners(tycoon)
+                        table.insert(actions, "upg")
+                    end
+                    if state.AutoUpgradePowers then
+                        doUpgradePowers(tycoon)
+                        table.insert(actions, "pow")
+                    end
+                    if state.AutoWake then
+                        doWake()
+                        table.insert(actions, "wake")
+                    end
+                    if state.AutoPhone then
+                        doPhone(tycoon)
+                        table.insert(actions, "deal")
+                    end
+                    if state.AutoFruit then
+                        table.insert(actions, "fruit")
+                    end
+                    if state.AutoRebirth then
+                        tryRebirth(tycoon)
+                        table.insert(actions, "rebirth")
+                    end
+                    if state.AutoEvolve then
+                        tryEvolve(tycoon)
+                        table.insert(actions, "evolve")
+                    end
+                    if state.AutoAscend then
+                        tryAscend(tycoon)
+                        table.insert(actions, "ascend")
+                    end
+
+                    status.actions = #actions > 0 and table.concat(actions, ", ") or "idle"
+                end)
+            else
+                status.actions = "waiting for tycoon..."
+            end
+
+            updateUi()
+            task.wait(0.1)
+        end
+    end)
+end
+
+local function buildFallbackGui()
+    local parent = LP:WaitForChild("PlayerGui")
+    local old = parent:FindFirstChild("LemonFarmGui")
+    if old then
+        old:Destroy()
+    end
+
+    local ACCENT = Color3.fromRGB(242, 201, 76)
+    local BG = Color3.fromRGB(22, 23, 28)
+    local BG2 = Color3.fromRGB(31, 33, 40)
+    local BG3 = Color3.fromRGB(45, 47, 56)
+    local TXT = Color3.fromRGB(236, 238, 243)
+    local SUB = Color3.fromRGB(146, 150, 162)
+    local OFFCOL = Color3.fromRGB(66, 68, 78)
+
+    local function corner(object, radius)
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, radius or 8)
+        c.Parent = object
+        return c
+    end
+
+    local function pad(object, top, bottom, left, right)
+        local p = Instance.new("UIPadding")
+        p.PaddingTop = UDim.new(0, top or 0)
+        p.PaddingBottom = UDim.new(0, bottom or 0)
+        p.PaddingLeft = UDim.new(0, left or 0)
+        p.PaddingRight = UDim.new(0, right or 0)
+        p.Parent = object
+        return p
+    end
+
+    local function safeSet(object, property, value)
+        pcall(function()
+            object[property] = value
+        end)
+    end
+
+    local function getViewportSize()
+        local camera = workspace.CurrentCamera
+        if camera and camera.ViewportSize.X > 0 and camera.ViewportSize.Y > 0 then
+            return camera.ViewportSize
+        end
+        return Vector2.new(1280, 720)
+    end
+
+    local viewport = getViewportSize()
+    local isMobile = game:GetService("UserInputService").TouchEnabled or viewport.X <= 820
+    local marginX = isMobile and 12 or 40
+    local marginY = isMobile and 16 or 32
+    local requestedWidth, requestedHeight = 318, 476
+    local minWidth = math.min(300, viewport.X - marginX * 2)
+    local minHeight = math.min(320, viewport.Y - marginY * 2)
+    local frameWidth = math.clamp(requestedWidth, minWidth, math.max(minWidth, viewport.X - marginX * 2))
+    local frameHeight = math.clamp(requestedHeight, minHeight, math.max(minHeight, viewport.Y - marginY * 2))
+    local barHeight = isMobile and 54 or 46
+    local buttonSize = isMobile and 34 or 28
+    local smallText = isMobile and 12 or 11
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "LemonFarmGui"
+    gui.ResetOnSpawn = false
+    safeSet(gui, "ZIndexBehavior", Enum.ZIndexBehavior.Sibling)
+    safeSet(gui, "IgnoreGuiInset", true)
+    safeSet(gui, "DisplayOrder", 999)
+    gui.Parent = parent
+
+    local main = Instance.new("Frame")
+    main.Name = "Main"
+    main.Size = UDim2.new(0, frameWidth, 0, frameHeight)
+    main.AnchorPoint = isMobile and Vector2.new(0.5, 0.5) or Vector2.new(0, 0)
+    main.Position = isMobile and UDim2.new(0.5, 0, 0.5, 0) or UDim2.new(0, marginX, 0.5, -math.floor(frameHeight / 2))
+    main.BackgroundColor3 = BG
+    main.BorderSizePixel = 0
+    main.Parent = gui
+    corner(main, 14)
+
+    local mainStroke = Instance.new("UIStroke")
+    mainStroke.Color = Color3.fromRGB(0, 0, 0)
+    mainStroke.Transparency = 0.45
+    mainStroke.Thickness = 1.5
+    mainStroke.Parent = main
+
+    local bar = Instance.new("Frame")
+    bar.Name = "Bar"
+    bar.Size = UDim2.new(1, 0, 0, barHeight)
+    bar.BackgroundColor3 = BG2
+    bar.BorderSizePixel = 0
+    bar.Parent = main
+    corner(bar, 14)
+
+    local barFill = Instance.new("Frame")
+    barFill.Size = UDim2.new(1, 0, 0, 16)
+    barFill.Position = UDim2.new(0, 0, 1, -16)
+    barFill.BackgroundColor3 = BG2
+    barFill.BorderSizePixel = 0
+    barFill.Parent = bar
+
+    local accentBar = Instance.new("Frame")
+    accentBar.Size = UDim2.new(0, 4, 0, 22)
+    accentBar.Position = UDim2.new(0, 12, 0.5, -11)
+    accentBar.BackgroundColor3 = ACCENT
+    accentBar.BorderSizePixel = 0
+    accentBar.ZIndex = 2
+    accentBar.Parent = bar
+    corner(accentBar, 2)
+
+    local title = Instance.new("TextLabel")
+    title.BackgroundTransparency = 1
+    title.Size = UDim2.new(1, isMobile and -112 or -110, 1, 0)
+    title.Position = UDim2.new(0, 24, 0, 0)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = isMobile and 15 or 16
+    title.TextColor3 = TXT
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Text = "Mango Hub - Sell Lemons"
+    title.ZIndex = 2
+    title.Parent = bar
+
+    local function barBtn(text, xOffset, color)
+        local button = Instance.new("TextButton")
+        button.Size = UDim2.new(0, buttonSize, 0, buttonSize)
+        button.Position = UDim2.new(1, xOffset, 0.5, -math.floor(buttonSize / 2))
+        button.BackgroundColor3 = BG3
+        button.Text = text
+        button.Font = Enum.Font.GothamBold
+        button.TextSize = isMobile and 16 or 15
+        button.TextColor3 = color or TXT
+        button.BorderSizePixel = 0
+        button.ZIndex = 2
+        button.Parent = bar
+        corner(button, 8)
+        return button
+    end
+
+    local closeBtn = barBtn("X", -(isMobile and 12 + buttonSize or 36), Color3.fromRGB(235, 120, 120))
+    local minBtn = barBtn("-", -(isMobile and 18 + buttonSize * 2 or 70))
+
+    local body = Instance.new("ScrollingFrame")
+    body.Name = "Body"
+    body.Size = UDim2.new(1, 0, 1, -barHeight)
+    body.Position = UDim2.new(0, 0, 0, barHeight)
+    body.BackgroundTransparency = 1
+    body.BorderSizePixel = 0
+    body.ScrollBarThickness = 4
+    body.ScrollBarImageColor3 = ACCENT
+    body.ScrollBarImageTransparency = 0.3
+    body.CanvasSize = UDim2.new(0, 0, 0, 0)
+    body.Parent = main
+    pad(body, 10, 12, isMobile and 10 or 12, isMobile and 10 or 8)
+
+    local bodyLayout = Instance.new("UIListLayout")
+    bodyLayout.Padding = UDim.new(0, 7)
+    bodyLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    bodyLayout.Parent = body
+
+    local function refreshBodyCanvas()
+        body.CanvasSize = UDim2.new(0, 0, 0, bodyLayout.AbsoluteContentSize.Y + 12)
+    end
+    bodyLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(refreshBodyCanvas)
+    refreshBodyCanvas()
+
+    local order = 0
+    local function nextOrder()
+        order = order + 1
+        return order
+    end
+
+    local stat = Instance.new("Frame")
+    stat.Size = UDim2.new(1, 0, 0, isMobile and 112 or 104)
+    stat.BackgroundColor3 = BG2
+    stat.BorderSizePixel = 0
+    stat.LayoutOrder = nextOrder()
+    stat.Parent = body
+    corner(stat, 10)
+    pad(stat, 9, 9, 11, 11)
+
+    local statLayout = Instance.new("UIListLayout")
+    statLayout.Padding = UDim.new(0, 3)
+    statLayout.Parent = stat
+
+    local function statRow(text)
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1, 0, 0, isMobile and 18 or 17)
+        row.BackgroundTransparency = 1
+        row.Parent = stat
+
+        local key = Instance.new("TextLabel")
+        key.BackgroundTransparency = 1
+        key.Size = UDim2.new(0.55, 0, 1, 0)
+        key.Font = Enum.Font.Gotham
+        key.TextSize = isMobile and 14 or 13
+        key.TextColor3 = SUB
+        key.TextXAlignment = Enum.TextXAlignment.Left
+        key.Text = text
+        key.Parent = row
+
+        local value = Instance.new("TextLabel")
+        value.BackgroundTransparency = 1
+        value.Size = UDim2.new(0.45, 0, 1, 0)
+        value.Position = UDim2.new(0.55, 0, 0, 0)
+        value.Font = Enum.Font.GothamBold
+        value.TextSize = isMobile and 14 or 13
+        value.TextColor3 = TXT
+        value.TextXAlignment = Enum.TextXAlignment.Right
+        value.Text = "--"
+        value.Parent = row
+
+        return value
+    end
+
+    local vCash = statRow("Cash")
+    local vInv = statRow("Investors")
+    local vReb = statRow("Rebirths")
+    local vEvo = statRow("Evolution")
+    local vActions = statRow("Actions")
+
+    local function section(text)
+        local header = Instance.new("TextLabel")
+        header.Size = UDim2.new(1, 0, 0, 18)
+        header.BackgroundTransparency = 1
+        header.Font = Enum.Font.GothamBold
+        header.TextSize = isMobile and 13 or 12
+        header.TextColor3 = ACCENT
+        header.TextXAlignment = Enum.TextXAlignment.Left
+        header.Text = text
+        header.LayoutOrder = nextOrder()
+        header.Parent = body
+        pad(header, 4, 0, 2, 0)
+    end
+
+    local function toggleRow(label, description, key)
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1, 0, 0, isMobile and 54 or 44)
+        row.BackgroundColor3 = BG2
+        row.BorderSizePixel = 0
+        row.LayoutOrder = nextOrder()
+        row.Parent = body
+        corner(row, 10)
+        pad(row, 0, 0, 11, 10)
+
+        local lbl = Instance.new("TextLabel")
+        lbl.BackgroundTransparency = 1
+        lbl.Size = UDim2.new(1, isMobile and -74 or -58, 0, 15)
+        lbl.Position = UDim2.new(0, 0, 0, isMobile and 10 or 8)
+        lbl.Font = Enum.Font.GothamBold
+        lbl.TextSize = isMobile and 14 or 13
+        lbl.TextColor3 = TXT
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Text = label
+        lbl.Parent = row
+
+        local sub = Instance.new("TextLabel")
+        sub.BackgroundTransparency = 1
+        sub.Size = UDim2.new(1, isMobile and -74 or -58, 0, 12)
+        sub.Position = UDim2.new(0, 0, 0, isMobile and 28 or 23)
+        sub.Font = Enum.Font.Gotham
+        sub.TextSize = smallText
+        sub.TextColor3 = SUB
+        sub.TextXAlignment = Enum.TextXAlignment.Left
+        sub.Text = description
+        sub.Parent = row
+
+        local sw = Instance.new("TextButton")
+        sw.Text = ""
+        sw.AutoButtonColor = false
+        local switchWidth = isMobile and 48 or 42
+        local switchHeight = isMobile and 26 or 22
+        local knobSize = isMobile and 22 or 18
+        sw.Size = UDim2.new(0, switchWidth, 0, switchHeight)
+        sw.Position = UDim2.new(1, -switchWidth, 0.5, -math.floor(switchHeight / 2))
+        sw.BackgroundColor3 = OFFCOL
+        sw.BorderSizePixel = 0
+        sw.Parent = row
+        corner(sw, math.floor(switchHeight / 2))
+
+        local knob = Instance.new("Frame")
+        knob.Size = UDim2.new(0, knobSize, 0, knobSize)
+        knob.Position = UDim2.new(0, 2, 0.5, -math.floor(knobSize / 2))
+        knob.BackgroundColor3 = Color3.fromRGB(236, 236, 236)
+        knob.BorderSizePixel = 0
+        knob.Parent = sw
+        corner(knob, math.floor(knobSize / 2))
+
+        local function render()
+            local on = state[key]
+            sw.BackgroundColor3 = on and ACCENT or OFFCOL
+            knob.Position = on and UDim2.new(1, -(knobSize + 2), 0.5, -math.floor(knobSize / 2)) or UDim2.new(0, 2, 0.5, -math.floor(knobSize / 2))
+        end
+
+        sw.MouseButton1Click:Connect(function()
+            state[key] = not state[key]
+            if key == "AutoFruit" and state[key] then
+                gatherFruit()
+            end
+            render()
+        end)
+
+        render()
+    end
+
+    section("AUTO FARM")
+    toggleRow("Auto Buy Tiles", "Buys affordable purchase tiles", "AutoBuy")
+    toggleRow("Auto Upgrade Earners", "Bulk upgrades cash machines", "AutoUpgradeEarners")
+    toggleRow("Auto Upgrade Powers", "Spends investors on powers", "AutoUpgradePowers")
+    toggleRow("Auto Collect Fruit", "Harvests lemons automatically", "AutoFruit")
+    toggleRow("Auto Wake Earners", "Triggers manual earners", "AutoWake")
+    toggleRow("Auto Collect Cash Drops", "Claims drops instantly", "AutoCashDrop")
+    toggleRow("Auto Phone Deals", "Accepts phone deals", "AutoPhone")
+
+    section("PROGRESSION")
+    toggleRow("Auto Rebirth", "Rebirths automatically", "AutoRebirth")
+    toggleRow("Auto Evolve", "Evolves at 100%", "AutoEvolve")
+    toggleRow("Auto Ascend", "Ascends at 100%", "AutoAscend")
+
+    section("UTILITY")
+    toggleRow("Anti-AFK", "Prevents idle disconnect", "AntiAFK")
+    toggleRow("Enable Walk Speed", "Applies custom speed", "SpeedOn")
+
+    local speedRow = Instance.new("Frame")
+    speedRow.Size = UDim2.new(1, 0, 0, isMobile and 74 or 62)
+    speedRow.BackgroundColor3 = BG2
+    speedRow.BorderSizePixel = 0
+    speedRow.LayoutOrder = nextOrder()
+    speedRow.Parent = body
+    corner(speedRow, 10)
+    pad(speedRow, 0, 0, 11, 11)
+
+    local speedLabel = Instance.new("TextLabel")
+    speedLabel.BackgroundTransparency = 1
+    speedLabel.Size = UDim2.new(1, isMobile and -72 or -58, 0, 15)
+    speedLabel.Position = UDim2.new(0, 0, 0, isMobile and 10 or 7)
+    speedLabel.Font = Enum.Font.GothamBold
+    speedLabel.TextSize = isMobile and 14 or 13
+    speedLabel.TextColor3 = TXT
+    speedLabel.TextXAlignment = Enum.TextXAlignment.Left
+    speedLabel.Text = "Walk Speed"
+    speedLabel.Parent = speedRow
+
+    local speedValue = Instance.new("TextLabel")
+    speedValue.BackgroundTransparency = 1
+    speedValue.Size = UDim2.new(0, 60, 0, 15)
+    speedValue.Position = UDim2.new(1, -70, 0, isMobile and 10 or 7)
+    speedValue.Font = Enum.Font.Gotham
+    speedValue.TextSize = isMobile and 13 or 12
+    speedValue.TextColor3 = SUB
+    speedValue.TextXAlignment = Enum.TextXAlignment.Right
+    speedValue.Text = tostring(state.SpeedVal)
+    speedValue.Parent = speedRow
+
+    local track = Instance.new("Frame")
+    local sliderTrackHeight = isMobile and 8 or 6
+    local sliderKnobSize = isMobile and 18 or 14
+    track.Size = UDim2.new(1, 0, 0, sliderTrackHeight)
+    track.Position = UDim2.new(0, 0, 1, -16)
+    track.BackgroundColor3 = BG3
+    track.BorderSizePixel = 0
+    track.Parent = speedRow
+    corner(track, math.floor(sliderTrackHeight / 2))
+
+    local fill = Instance.new("Frame")
+    fill.BackgroundColor3 = ACCENT
+    fill.BorderSizePixel = 0
+    fill.Parent = track
+    corner(fill, math.floor(sliderTrackHeight / 2))
+
+    local speedKnob = Instance.new("Frame")
+    speedKnob.Size = UDim2.new(0, sliderKnobSize, 0, sliderKnobSize)
+    speedKnob.BackgroundColor3 = TXT
+    speedKnob.BorderSizePixel = 0
+    speedKnob.ZIndex = 2
+    speedKnob.Parent = track
+    corner(speedKnob, math.floor(sliderKnobSize / 2))
+
+    local function setSpeedAlpha(alpha)
+        alpha = math.clamp(alpha, 0, 1)
+        local value = math.floor(16 + (150 - 16) * alpha + 0.5)
+        state.SpeedVal = value
+        speedValue.Text = tostring(value)
+        fill.Size = UDim2.new(alpha, 0, 1, 0)
+        speedKnob.Position = UDim2.new(alpha, -math.floor(sliderKnobSize / 2), 0.5, -math.floor(sliderKnobSize / 2))
+    end
+
+    setSpeedAlpha((state.SpeedVal - 16) / (150 - 16))
+
+    local draggingSlider = false
+    local function updateSlider(x)
+        setSpeedAlpha((x - track.AbsolutePosition.X) / track.AbsoluteSize.X)
+    end
+
+    track.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            draggingSlider = true
+            updateSlider(input.Position.X)
+        end
+    end)
+
+    game:GetService("UserInputService").InputChanged:Connect(function(input)
+        if draggingSlider and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            updateSlider(input.Position.X)
+        end
+    end)
+
+    game:GetService("UserInputService").InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            draggingSlider = false
+        end
+    end)
+
+    updateUi = function()
+        if not gui.Parent then
+            return
+        end
+        vCash.Text = status.cash
+        vInv.Text = status.investors
+        vReb.Text = status.rebirths
+        vEvo.Text = status.evolve
+        vActions.Text = status.actions
+    end
+
+    local function clampWindowPosition()
+        if isMobile then
+            main.Position = UDim2.new(0.5, 0, 0.5, 0)
+            return
+        end
+
+        local currentViewport = getViewportSize()
+        local maxX = math.max(8, currentViewport.X - main.AbsoluteSize.X - 8)
+        local maxY = math.max(8, currentViewport.Y - main.AbsoluteSize.Y - 8)
+        local offsetX = math.clamp(main.Position.X.Offset, 8, maxX)
+        local offsetY = math.clamp(main.Position.Y.Offset, 8, maxY)
+        main.Position = UDim2.new(0, math.floor(offsetX), 0, math.floor(offsetY))
+    end
+
+    local dragging, dragStart, startPos
+    if not isMobile then
+        bar.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                dragStart = input.Position
+                startPos = main.Position
+                input.Changed:Connect(function()
+                    if input.UserInputState == Enum.UserInputState.End then
+                        dragging = false
+                    end
+                end)
+            end
+        end)
+
+        game:GetService("UserInputService").InputChanged:Connect(function(input)
+            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+                local delta = input.Position - dragStart
+                main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+                clampWindowPosition()
+            end
+        end)
+    end
+
+    local minimized = false
+    minBtn.MouseButton1Click:Connect(function()
+        minimized = not minimized
+        main.Size = minimized and UDim2.new(0, frameWidth, 0, barHeight) or UDim2.new(0, frameWidth, 0, frameHeight)
+        clampWindowPosition()
+    end)
+
+    closeBtn.MouseButton1Click:Connect(function()
+        scriptAlive = false
+        for key, value in pairs(state) do
+            if type(value) == "boolean" then
+                state[key] = false
+            end
+        end
+        gui:Destroy()
+    end)
+
+    local camera = workspace.CurrentCamera
+    if camera then
+        camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+            clampWindowPosition()
+        end)
+    end
+
+    clampWindowPosition()
+end
+
+local function buildFluentGui()
+    local Window = Fluent:CreateWindow({
+        Title = "Mango Hub",
+        SubTitle = "Sell Lemons",
+        TabWidth = 160,
+        Size = UDim2.fromOffset(560, 460),
+        Acrylic = false,
+        Theme = "Darker",
+        MinimizeKey = Enum.KeyCode.LeftControl
+    })
+
+    Window:SetOnClose(function()
+        scriptAlive = false
+        for key, value in pairs(state) do
+            if type(value) == "boolean" then
+                state[key] = false
+            end
+        end
+    end)
+
+    local Tabs = {
+        Farm = Window:AddTab({ Title = "Farm", Icon = "bot" }),
+        Progression = Window:AddTab({ Title = "Progression", Icon = "trending-up" }),
+        Utility = Window:AddTab({ Title = "Utility", Icon = "wrench" }),
+        Stats = Window:AddTab({ Title = "Stats", Icon = "bar-chart-3" }),
+        Settings = Window:AddTab({ Title = "Settings", Icon = "settings" })
+    }
+
+    local statsParagraph = Tabs.Stats:AddParagraph({
+        Title = "Session Stats",
+        Content = "Cash: --\nInvestors: --\nRebirths: --\nEvolution: --\nActions: idle"
+    })
+
+    updateUi = function()
+        if statsParagraph and statsParagraph.SetDesc then
+            statsParagraph:SetDesc(string.format(
+                "Cash: %s\nInvestors: %s\nRebirths: %s\nEvolution: %s\nActions: %s",
+                status.cash,
+                status.investors,
+                status.rebirths,
+                status.evolve,
+                status.actions
+            ))
+        end
+    end
+
+    Tabs.Farm:AddToggle("AutoBuyToggle", {
+        Title = "Auto Buy Tiles",
+        Description = "Buys affordable purchase tiles automatically.",
+        Default = false
+    }):OnChanged(function(value)
+        state.AutoBuy = value
+    end)
+
+    Tabs.Farm:AddToggle("AutoUpgradeEarnersToggle", {
+        Title = "Auto Upgrade Earners",
+        Description = "Bulk upgrades cash machines when affordable.",
+        Default = false
+    }):OnChanged(function(value)
+        state.AutoUpgradeEarners = value
+    end)
+
+    Tabs.Farm:AddToggle("AutoUpgradePowersToggle", {
+        Title = "Auto Upgrade Powers",
+        Description = "Spends investors on power upgrades.",
+        Default = false
+    }):OnChanged(function(value)
+        state.AutoUpgradePowers = value
+    end)
+
+    Tabs.Farm:AddToggle("AutoFruitToggle", {
+        Title = "Auto Collect Fruit",
+        Description = "Teleports through lemon trees and harvests fruit.",
+        Default = false
+    }):OnChanged(function(value)
+        state.AutoFruit = value
+        if value then
+            gatherFruit()
+        end
+    end)
+
+    Tabs.Farm:AddToggle("AutoWakeToggle", {
+        Title = "Auto Wake Earners",
+        Description = "Triggers manual earners repeatedly.",
+        Default = false
+    }):OnChanged(function(value)
+        state.AutoWake = value
+    end)
+
+    Tabs.Farm:AddToggle("AutoCashDropToggle", {
+        Title = "Auto Collect Cash Drops",
+        Description = "Claims cash drops as soon as they appear.",
+        Default = false
+    }):OnChanged(function(value)
+        state.AutoCashDrop = value
+    end)
+
+    Tabs.Farm:AddToggle("AutoPhoneToggle", {
+        Title = "Auto Phone Deals",
+        Description = "Accepts current phone deals automatically.",
+        Default = false
+    }):OnChanged(function(value)
+        state.AutoPhone = value
+    end)
+
+    Tabs.Progression:AddToggle("AutoRebirthToggle", {
+        Title = "Auto Rebirth",
+        Description = "Rebirths when investors are available.",
+        Default = false
+    }):OnChanged(function(value)
+        state.AutoRebirth = value
+    end)
+
+    Tabs.Progression:AddToggle("AutoEvolveToggle", {
+        Title = "Auto Evolve",
+        Description = "Evolves at 100% progress.",
+        Default = false
+    }):OnChanged(function(value)
+        state.AutoEvolve = value
+    end)
+
+    Tabs.Progression:AddToggle("AutoAscendToggle", {
+        Title = "Auto Ascend",
+        Description = "Ascends at 100% progress.",
+        Default = false
+    }):OnChanged(function(value)
+        state.AutoAscend = value
+    end)
+
+    Tabs.Utility:AddToggle("AntiAfkToggle", {
+        Title = "Anti-AFK",
+        Description = "Prevents idle disconnects.",
+        Default = false
+    }):OnChanged(function(value)
+        state.AntiAFK = value
+    end)
+
+    Tabs.Utility:AddToggle("SpeedToggle", {
+        Title = "Enable Walk Speed",
+        Description = "Applies the selected walk speed continuously.",
+        Default = false
+    }):OnChanged(function(value)
+        state.SpeedOn = value
+    end)
+
+    Tabs.Utility:AddSlider("WalkSpeedSlider", {
+        Title = "Walk Speed",
+        Description = "Sets the target walk speed.",
+        Default = 16,
+        Min = 16,
+        Max = 150,
+        Rounding = 0,
+        Callback = function(value)
+            state.SpeedVal = math.floor(value + 0.5)
+        end
+    })
+
+    Tabs.Utility:AddButton({
+        Title = "Refresh Fruit Cache",
+        Description = "Rescans available lemon trees and fruit click detectors.",
+        Callback = function()
+            gatherFruit()
+            Fluent:Notify({
+                Title = "Sell Lemons",
+                Content = string.format("Fruit cache refreshed (%d fruit nodes found).", #fruitCache),
+                Duration = 4
+            })
+        end
+    })
+
+    Tabs.Stats:AddButton({
+        Title = "Copy Current Status",
+        Description = "Shows a quick summary notification of your current stats.",
+        Callback = function()
+            Fluent:Notify({
+                Title = "Sell Lemons Status",
+                Content = string.format(
+                    "Cash: %s | Investors: %s | Rebirths: %s | Evolution: %s | Actions: %s",
+                    status.cash,
+                    status.investors,
+                    status.rebirths,
+                    status.evolve,
+                    status.actions
+                ),
+                Duration = 5
+            })
+        end
+    })
+
+    SaveManager:SetLibrary(Fluent)
+    InterfaceManager:SetLibrary(Fluent)
+    SaveManager:IgnoreThemeSettings()
+    SaveManager:SetIgnoreIndexes({})
+    InterfaceManager:SetFolder("MangoHub")
+    SaveManager:SetFolder("MangoHub/sell-lemons")
+    InterfaceManager:BuildInterfaceSection(Tabs.Settings)
+    SaveManager:BuildConfigSection(Tabs.Settings)
+
+    Window:SelectTab(1)
+    SaveManager:LoadAutoloadConfig()
+
+    Fluent:Notify({
+        Title = "Mango Hub",
+        Content = "Sell Lemons loaded successfully.",
+        Duration = 4
+    })
+end
+
+local fluentOk, fluentErr = pcall(buildFluentGui)
+if not fluentOk then
+    warn("[Mango Hub] Fluent UI fallback activated: " .. tostring(fluentErr))
+    buildFallbackGui()
+end
+
+startLogicLoop()
+print("[Sell Lemons Farm] loaded")

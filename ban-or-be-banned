@@ -1,0 +1,991 @@
+-- Secure loading of Mango UI
+local Fluent, SaveManager, InterfaceManager
+
+local task = type(task) == "table" and task or {}
+if type(task.wait) ~= "function" then
+    task.wait = wait
+end
+if type(task.spawn) ~= "function" then
+    task.spawn = function(callback, ...)
+    local args = { ... }
+    return spawn(function()
+        callback(unpack(args))
+    end)
+    end
+end
+if type(task.delay) ~= "function" then
+    task.delay = function(delayTime, callback, ...)
+    local args = { ... }
+    return spawn(function()
+        wait(delayTime)
+        callback(unpack(args))
+    end)
+    end
+end
+
+local function getLoader()
+    if type(loadstring) == "function" then
+        return loadstring
+    end
+    if type(load) == "function" then
+        return load
+    end
+    return nil
+end
+
+local function httpGet(url)
+    local ok, result = pcall(function()
+        return game:HttpGet(url, true)
+    end)
+    if ok and type(result) == "string" and result ~= "" then
+        return true, result
+    end
+
+    local synTable = rawget(_G, "syn")
+    local fluxusTable = rawget(_G, "fluxus")
+    local requestImpl = rawget(_G, "request")
+        or rawget(_G, "http_request")
+        or rawget(_G, "http")
+        or rawget(_G, "requestfunc")
+        or (type(synTable) == "table" and synTable.request)
+        or (type(fluxusTable) == "table" and fluxusTable.request)
+
+    if type(requestImpl) ~= "function" then
+        return false, result
+    end
+
+    local requestOk, response = pcall(requestImpl, {
+        Url = url,
+        Method = "GET",
+    })
+
+    if not requestOk or type(response) ~= "table" then
+        return false, response
+    end
+
+    local body = response.Body or response.body
+    return type(body) == "string" and body ~= "", body or response.StatusMessage or "empty response"
+end
+
+local function loadRemoteModule(url, label)
+    local loader = getLoader()
+    if type(loader) ~= "function" then
+        return nil, "loadstring/load is not available"
+    end
+
+    local fetchOk, source = httpGet(url)
+    if not fetchOk or type(source) ~= "string" or source == "" then
+        return nil, "download failed: " .. tostring(source)
+    end
+
+    local chunk, compileErr = loader(source)
+    if type(chunk) ~= "function" then
+        return nil, "compile failed: " .. tostring(compileErr)
+    end
+
+    local runOk, result = pcall(chunk)
+    if not runOk then
+        return nil, "runtime failed: " .. tostring(result)
+    end
+
+    if result == nil then
+        return nil, label .. " returned nil"
+    end
+
+    return result
+end
+
+local success, err = pcall(function()
+    local factory = rawget(_G, "__MangoHubUIFactory")
+    if not factory then
+        factory, err = loadRemoteModule("https://raw.githubusercontent.com/linkoro57/Mango_Hub/main/mango-ui", "MangoUI")
+    end
+    if not factory then
+        error(err)
+    end
+    Fluent = factory.Fluent
+    SaveManager = factory.SaveManager
+    InterfaceManager = factory.InterfaceManager
+end)
+
+if not success or not Fluent then
+    warn("[Mango Hub] Failed to load Mango UI: " .. tostring(err))
+    return
+end
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local scriptAlive = true
+
+local Window = Fluent:CreateWindow({
+    Title = "Mango Hub",
+    SubTitle = "Ban or Be Banned",
+    TabWidth = 160,
+    Size = UDim2.fromOffset(640, 470),
+    Acrylic = false,
+    Theme = "Darker",
+    MinimizeKey = Enum.KeyCode.LeftControl
+})
+
+local Tabs = {
+    Main = Window:AddTab({ Title = "Main", Icon = "dollar-sign" }),
+    Teleport = Window:AddTab({ Title = "Teleport", Icon = "map-pin" }),
+    Tools = Window:AddTab({ Title = "Tools", Icon = "hammer" }),
+    Automation = Window:AddTab({ Title = "Automation", Icon = "bot" }),
+    Settings = Window:AddTab({ Title = "Settings", Icon = "settings" })
+}
+
+local Options = Fluent.Options
+
+local function notify(title, content, duration)
+    Fluent:Notify({
+        Title = title,
+        Content = content,
+        Duration = duration or 4
+    })
+end
+
+local state = {
+    moneyMagnet = false,
+    spinSpeed = 10,
+    collectRange = 15,
+    autoClaimDaily = false,
+    autoClaimFreePack = false,
+    autoMoneyButtons = false,
+    autoEquipSelectedTool = false,
+    preferredTool = "None",
+    selectedPlayer = nil,
+    selectedBanDuration = "Ban 5 Minutes",
+    selectedUnbanDuration = "Unban 5 Minutes",
+    noclip = false,
+}
+
+local toolAliases = {
+    BanHammer = { "BanHammer", "Ban Hammer" },
+    GravityCoil = { "GravityCoil", "Gravity Coil" },
+    MagicCarpet = { "MagicCarpet", "Rainbow Magic Carpet", "Magic Carpet" },
+    SpeedCoil = { "SpeedCoil", "Speed Coil" },
+}
+
+local banDurationMap = {
+    ["Ban 5 Minutes"] = "Button1",
+    ["Ban 15 Minutes"] = "Button2",
+    ["Ban 30 Minutes"] = "Button3",
+    ["Ban 1 Hour"] = "Button4",
+    ["Ban 1 Day"] = "Button5",
+    ["Ban 30 Days"] = "Button6",
+    ["Ban 365 Days"] = "Button7",
+}
+
+local unbanDurationMap = {
+    ["Unban 5 Minutes"] = "Button1",
+    ["Unban 15 Minutes"] = "Button2",
+    ["Unban 30 Minutes"] = "Button3",
+    ["Unban 1 Hour"] = "Button4",
+    ["Unban 1 Day"] = "Button5",
+    ["Unban 30 Days"] = "Button6",
+    ["Unban 365 Days"] = "Button7",
+}
+
+local teleportSpots = {
+    Spawn = Vector3.new(0, 4, 0),
+    Jail = Vector3.new(0, 1039, -51),
+    BanButtons = Vector3.new(62.5, 4, -3.7),
+    UnbanButtons = Vector3.new(-62, 4, -3.7),
+    MoneyButtons = Vector3.new(0.5, 4, 334),
+    CircleJumpStage = Vector3.new(-5.3, 4, 125.1),
+    GravityCoilGiver = Vector3.new(37, 4, 24.3),
+    SpeedCoilGiver = Vector3.new(43.5, 4, 24.3),
+    MagicCarpetGiver = Vector3.new(30.5, 4, 24.3),
+}
+
+local moneyParts = {}
+local spinAngle = 0
+local hue = 0
+local loopConn
+
+local statsParagraph = Tabs.Main:AddParagraph({
+    Title = "Live Stats",
+    Content = "Loading..."
+})
+
+local inventoryParagraph = Tabs.Tools:AddParagraph({
+    Title = "Inventory",
+    Content = "Loading..."
+})
+
+local automationParagraph = Tabs.Automation:AddParagraph({
+    Title = "Automation Status",
+    Content = "Idle"
+})
+
+local playerDropdown
+
+local function normalizeName(text)
+    return string.lower((tostring(text or "")):gsub("[%s_%-]", ""))
+end
+
+local function getCharacter()
+    return player.Character or player.CharacterAdded:Wait()
+end
+
+local function getRootPart()
+    local model = getCharacter()
+    return model:FindFirstChild("HumanoidRootPart")
+        or model:FindFirstChild("UpperTorso")
+        or model:FindFirstChild("Torso")
+end
+
+local function getHumanoid()
+    local model = getCharacter()
+    return model:FindFirstChildOfClass("Humanoid")
+end
+
+local function getTorso()
+    return getRootPart()
+end
+
+local function getMoneyParts()
+    local results = {}
+    local decoration = Workspace:FindFirstChild("Decoration")
+    if not decoration then
+        return results
+    end
+
+    for _, child in ipairs(decoration:GetChildren()) do
+        if child:IsA("BasePart") then
+            local hasScript = child:FindFirstChildOfClass("Script")
+            local hasTouch = child:FindFirstChildOfClass("TouchTransmitter") or child:FindFirstChild("TouchInterest")
+            if hasScript and hasTouch then
+                table.insert(results, child)
+            end
+        end
+    end
+
+    return results
+end
+
+local function preparePart(part)
+    if not part or not part:IsA("BasePart") then
+        return
+    end
+    part.Anchored = true
+    part.CanCollide = false
+end
+
+local function touchPart(part)
+    local rootPart = getRootPart()
+    if not rootPart or not part or not part:IsA("BasePart") then
+        return false
+    end
+
+    rootPart.CFrame = part.CFrame + Vector3.new(0, 3, 0)
+    task.wait(0.08)
+
+    if type(firetouchinterest) == "function" then
+        firetouchinterest(rootPart, part, 0)
+        firetouchinterest(rootPart, part, 1)
+    end
+
+    return true
+end
+
+local function teleportToVector(position)
+    local rootPart = getRootPart()
+    if not rootPart then
+        return false
+    end
+    rootPart.CFrame = CFrame.new(position)
+    return true
+end
+
+local function teleportToPlayer(name)
+    local target = Players:FindFirstChild(name)
+    local targetCharacter = target and target.Character
+    local targetRoot = targetCharacter and targetCharacter:FindFirstChild("HumanoidRootPart")
+    local rootPart = getRootPart()
+    if not rootPart or not targetRoot then
+        return false
+    end
+
+    rootPart.CFrame = targetRoot.CFrame * CFrame.new(0, 0, 3)
+    return true
+end
+
+local function getPlayerChoices()
+    local values = {}
+    for _, otherPlayer in ipairs(Players:GetPlayers()) do
+        if otherPlayer ~= player then
+            table.insert(values, otherPlayer.Name)
+        end
+    end
+    table.sort(values)
+    if #values == 0 then
+        values = { "Nobody" }
+    end
+    return values
+end
+
+local function refreshPlayerDropdown()
+    local values = getPlayerChoices()
+    if not state.selectedPlayer or not Players:FindFirstChild(state.selectedPlayer) then
+        state.selectedPlayer = values[1]
+    end
+    if playerDropdown and playerDropdown.SetValues then
+        playerDropdown:SetValues(values)
+    end
+    if playerDropdown and playerDropdown.SetValue and state.selectedPlayer then
+        pcall(function()
+            playerDropdown:SetValue(state.selectedPlayer)
+        end)
+    end
+end
+
+local function findMatchingTool(name)
+    if name == "None" then
+        return nil
+    end
+
+    local aliases = toolAliases[name] or { name }
+    local lookup = {}
+    for _, alias in ipairs(aliases) do
+        lookup[normalizeName(alias)] = true
+    end
+
+    local containers = { player.Backpack, getCharacter() }
+    for _, container in ipairs(containers) do
+        if container then
+            for _, child in ipairs(container:GetChildren()) do
+                if child:IsA("Tool") and lookup[normalizeName(child.Name)] then
+                    return child
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+local function equipPreferredTool()
+    local humanoid = getHumanoid()
+    if not humanoid or state.preferredTool == "None" then
+        return false
+    end
+
+    local tool = findMatchingTool(state.preferredTool)
+    if not tool then
+        return false
+    end
+
+    pcall(function()
+        humanoid:EquipTool(tool)
+    end)
+    return true
+end
+
+local function claimOwnedTool(toolName)
+    local ownedValue = player:FindFirstChild("OwnedTools") and player.OwnedTools:FindFirstChild(toolName)
+    if not ownedValue or ownedValue.Value ~= true then
+        return false
+    end
+
+    local giverName = ({
+        GravityCoil = "Gravity Coil Giver",
+        SpeedCoil = "Speed Coil Giver",
+        MagicCarpet = "Rainbow Magic Carpet giver",
+    })[toolName]
+
+    if not giverName then
+        return false
+    end
+
+    local toolsFolder = Workspace:FindFirstChild("Tools")
+    local giver = toolsFolder and toolsFolder:FindFirstChild(giverName)
+    local giverPart = giver and giver:FindFirstChildWhichIsA("BasePart", true)
+    if not giverPart then
+        return false
+    end
+
+    return touchPart(giverPart)
+end
+
+local function updateStatsParagraph()
+    local leaderstats = player:FindFirstChild("leaderstats")
+    local money = leaderstats and leaderstats:FindFirstChild("Money")
+    local noBan = leaderstats and leaderstats:FindFirstChild("NoBanTime")
+    local bans = leaderstats and leaderstats:FindFirstChild("Bans")
+    local dailyRewardDay = player:FindFirstChild("DailyRewardDay")
+    local nextRewardTime = player:FindFirstChild("NextRewardTime")
+    local freePackClaimed = player:FindFirstChild("FreePackClaimed")
+    local freePackTime = player:FindFirstChild("FreePackTime")
+
+    local nextDailyIn = nextRewardTime and math.max(nextRewardTime.Value - os.time(), 0) or 0
+    local freePackIn = freePackTime and math.max(math.floor(freePackTime.Value), 0) or 0
+
+    statsParagraph:SetDesc(table.concat({
+        "Money: $" .. tostring(money and money.Value or "?"),
+        "Bans: " .. tostring(bans and bans.Value or "?"),
+        "NoBanTime: " .. tostring(noBan and noBan.Value or "?"),
+        "Daily Day: " .. tostring(dailyRewardDay and dailyRewardDay.Value or "?"),
+        "Daily Ready In: " .. tostring(nextDailyIn) .. "s",
+        "Free Pack Claimed: " .. tostring(freePackClaimed and freePackClaimed.Value or false),
+        "Free Pack Ready In: " .. tostring(freePackIn) .. "s",
+    }, "\n"))
+end
+
+local function updateInventoryParagraph()
+    local lines = {}
+    local ownedTools = player:FindFirstChild("OwnedTools")
+    local banInventory = player:FindFirstChild("BanInventory")
+    local unbanInventory = player:FindFirstChild("UnbanInventory")
+
+    if ownedTools then
+        for _, child in ipairs(ownedTools:GetChildren()) do
+            table.insert(lines, child.Name .. ": " .. tostring(child.Value))
+        end
+    end
+
+    if banInventory then
+        for _, child in ipairs(banInventory:GetChildren()) do
+            table.insert(lines, child.Name .. ": " .. tostring(child.Value))
+        end
+    end
+
+    if unbanInventory then
+        for _, child in ipairs(unbanInventory:GetChildren()) do
+            table.insert(lines, child.Name .. ": " .. tostring(child.Value))
+        end
+    end
+
+    table.sort(lines)
+    inventoryParagraph:SetDesc(#lines > 0 and table.concat(lines, "\n") or "Nothing found.")
+end
+
+local function updateAutomationParagraph()
+    automationParagraph:SetDesc(table.concat({
+        "Money Magnet: " .. tostring(state.moneyMagnet),
+        "Auto Claim Daily: " .. tostring(state.autoClaimDaily),
+        "Auto Claim Free Pack: " .. tostring(state.autoClaimFreePack),
+        "Auto Money Buttons: " .. tostring(state.autoMoneyButtons),
+        "Auto Equip Tool: " .. tostring(state.autoEquipSelectedTool),
+        "Preferred Tool: " .. tostring(state.preferredTool),
+        "Target Player: " .. tostring(state.selectedPlayer or "None"),
+    }, "\n"))
+end
+
+local function refreshMoneyParts()
+    moneyParts = getMoneyParts()
+    for _, part in ipairs(moneyParts) do
+        preparePart(part)
+    end
+end
+
+local function startLoop()
+    if loopConn then
+        loopConn:Disconnect()
+        loopConn = nil
+    end
+
+    refreshMoneyParts()
+    loopConn = RunService.Heartbeat:Connect(function(dt)
+        if not state.moneyMagnet then
+            return
+        end
+
+        local torso = getTorso()
+        if not torso then
+            return
+        end
+
+        local anyMissing = false
+        for _, part in ipairs(moneyParts) do
+            if not part or not part.Parent then
+                anyMissing = true
+                break
+            end
+        end
+
+        if anyMissing then
+            refreshMoneyParts()
+        end
+
+        hue = (hue + dt * 0.08) % 1
+        spinAngle = (spinAngle + dt * state.spinSpeed) % (2 * math.pi)
+
+        for _, part in ipairs(moneyParts) do
+            pcall(function()
+                local distance = (part.Position - torso.Position).Magnitude
+                if distance <= state.collectRange or state.collectRange >= 30 then
+                    part.Color = Color3.fromHSV(hue, 1, 1)
+                    part.CFrame = CFrame.new(torso.Position)
+                        * CFrame.Angles(spinAngle, spinAngle * 1.3, spinAngle * 0.7)
+                end
+            end)
+        end
+    end)
+end
+
+local function stopLoop()
+    if loopConn then
+        loopConn:Disconnect()
+        loopConn = nil
+    end
+end
+
+local function getButtonPart(folderName, buttonName)
+    local folder = Workspace:FindFirstChild(folderName)
+    local model = folder and folder:FindFirstChild(buttonName)
+    return model and model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function triggerSelectedDuration(folderName, buttonMap, selectedDuration)
+    local part = getButtonPart(folderName, buttonMap[selectedDuration])
+    if not part then
+        return false
+    end
+    return touchPart(part)
+end
+
+local function triggerSelectedPlayerPrompt()
+    local target = Players:FindFirstChild(state.selectedPlayer or "")
+    local targetCharacter = target and target.Character
+    local targetRoot = targetCharacter and targetCharacter:FindFirstChild("HumanoidRootPart")
+    local prompt = targetRoot and targetRoot:FindFirstChild("BanPrompt")
+    if not prompt then
+        return false
+    end
+
+    if type(fireproximityprompt) == "function" then
+        pcall(function()
+            fireproximityprompt(prompt)
+        end)
+        return true
+    end
+
+    return false
+end
+
+Tabs.Main:AddToggle("InfiniteMoneyToggle", {
+    Title = "Enable Infinite Money",
+    Description = "Pulls nearby money parts onto your character.",
+    Default = false
+}):OnChanged(function(value)
+    state.moneyMagnet = value
+    if value then
+        startLoop()
+        notify("Infinite Money", "Money magnet enabled.", 4)
+    else
+        stopLoop()
+        notify("Infinite Money", "Money magnet disabled.", 3)
+    end
+    updateAutomationParagraph()
+end)
+
+Tabs.Main:AddSlider("SpinSpeedSlider", {
+    Title = "Spin Speed",
+    Description = "How fast money spins around you.",
+    Default = 10,
+    Min = 1,
+    Max = 50,
+    Rounding = 1,
+    Callback = function(value)
+        state.spinSpeed = value
+    end
+})
+
+Tabs.Main:AddSlider("RangeSlider", {
+    Title = "Collection Range",
+    Description = "How far money can be pulled from.",
+    Default = 15,
+    Min = 5,
+    Max = 30,
+    Rounding = 1,
+    Callback = function(value)
+        state.collectRange = value
+    end
+})
+
+Tabs.Main:AddButton({
+    Title = "Refresh Money Parts",
+    Description = "Rescans the Decoration folder.",
+    Callback = function()
+        refreshMoneyParts()
+        notify("Money", "Money parts refreshed: " .. tostring(#moneyParts), 3)
+    end
+})
+
+playerDropdown = Tabs.Teleport:AddDropdown("PlayerDropdown", {
+    Title = "Target Player",
+    Values = getPlayerChoices(),
+    Multi = false,
+    Default = getPlayerChoices()[1],
+    Callback = function(value)
+        state.selectedPlayer = value
+        updateAutomationParagraph()
+    end
+})
+
+Tabs.Teleport:AddButton({
+    Title = "Teleport To Selected Player",
+    Description = "Moves next to the selected player.",
+    Callback = function()
+        if teleportToPlayer(state.selectedPlayer) then
+            notify("Teleport", "Teleported to " .. tostring(state.selectedPlayer), 3)
+        else
+            notify("Teleport", "Could not find that player right now.", 3)
+        end
+    end
+})
+
+for name, position in pairs(teleportSpots) do
+    Tabs.Teleport:AddButton({
+        Title = "Teleport: " .. name,
+        Description = "Jump to " .. name,
+        Callback = function()
+            if teleportToVector(position) then
+                notify("Teleport", "Moved to " .. name, 3)
+            end
+        end
+    })
+end
+
+Tabs.Teleport:AddDropdown("BanDurationDropdown", {
+    Title = "Ban Button",
+    Values = {
+        "Ban 5 Minutes",
+        "Ban 15 Minutes",
+        "Ban 30 Minutes",
+        "Ban 1 Hour",
+        "Ban 1 Day",
+        "Ban 30 Days",
+        "Ban 365 Days",
+    },
+    Multi = false,
+    Default = state.selectedBanDuration,
+    Callback = function(value)
+        state.selectedBanDuration = value
+    end
+})
+
+Tabs.Teleport:AddDropdown("UnbanDurationDropdown", {
+    Title = "Unban Button",
+    Values = {
+        "Unban 5 Minutes",
+        "Unban 15 Minutes",
+        "Unban 30 Minutes",
+        "Unban 1 Hour",
+        "Unban 1 Day",
+        "Unban 30 Days",
+        "Unban 365 Days",
+    },
+    Multi = false,
+    Default = state.selectedUnbanDuration,
+    Callback = function(value)
+        state.selectedUnbanDuration = value
+    end
+})
+
+Tabs.Teleport:AddButton({
+    Title = "Touch Selected Ban Button",
+    Description = "Touches the chosen physical ban button row.",
+    Callback = function()
+        if triggerSelectedDuration("BanButtons", banDurationMap, state.selectedBanDuration) then
+            notify("Ban Buttons", "Touched " .. state.selectedBanDuration, 3)
+        else
+            notify("Ban Buttons", "Could not touch the selected ban button.", 3)
+        end
+    end
+})
+
+Tabs.Teleport:AddButton({
+    Title = "Touch Selected Unban Button",
+    Description = "Touches the chosen physical unban button row.",
+    Callback = function()
+        if triggerSelectedDuration("UnbanButtons", unbanDurationMap, state.selectedUnbanDuration) then
+            notify("Unban Buttons", "Touched " .. state.selectedUnbanDuration, 3)
+        else
+            notify("Unban Buttons", "Could not touch the selected unban button.", 3)
+        end
+    end
+})
+
+Tabs.Tools:AddDropdown("PreferredToolDropdown", {
+    Title = "Preferred Tool",
+    Values = { "None", "BanHammer", "GravityCoil", "MagicCarpet", "SpeedCoil" },
+    Multi = false,
+    Default = state.preferredTool,
+    Callback = function(value)
+        state.preferredTool = value
+        updateAutomationParagraph()
+    end
+})
+
+Tabs.Tools:AddToggle("AutoEquipToolToggle", {
+    Title = "Auto Equip Preferred Tool",
+    Description = "Re-equips the selected tool when available.",
+    Default = false
+}):OnChanged(function(value)
+    state.autoEquipSelectedTool = value
+    if value then
+        equipPreferredTool()
+    end
+    updateAutomationParagraph()
+end)
+
+Tabs.Tools:AddButton({
+    Title = "Equip Preferred Tool Now",
+    Description = "Tries to equip the chosen tool immediately.",
+    Callback = function()
+        if equipPreferredTool() then
+            notify("Tools", "Equipped " .. state.preferredTool, 3)
+        else
+            notify("Tools", "Tool not found in Backpack/Character.", 3)
+        end
+    end
+})
+
+Tabs.Tools:AddButton({
+    Title = "Claim Owned Tools",
+    Description = "Touches the owned givers for coils/carpet.",
+    Callback = function()
+        local claimed = 0
+        for _, toolName in ipairs({ "GravityCoil", "SpeedCoil", "MagicCarpet" }) do
+            if claimOwnedTool(toolName) then
+                claimed = claimed + 1
+                task.wait(0.15)
+            end
+        end
+        notify("Tools", "Touched " .. tostring(claimed) .. " owned givers.", 4)
+    end
+})
+
+Tabs.Tools:AddButton({
+    Title = "Buy Ban Hammer With Money",
+    Description = "Uses the Ban Hammer money purchase remote.",
+    Callback = function()
+        pcall(function()
+            ReplicatedStorage.BanHammer_RequestMoneyPurchase:FireServer()
+        end)
+        notify("Ban Hammer", "Purchase request sent.", 3)
+    end
+})
+
+Tabs.Tools:AddButton({
+    Title = "Trigger Selected Player BanPrompt",
+    Description = "Fires the selected player's BanPrompt if your executor supports it.",
+    Callback = function()
+        if triggerSelectedPlayerPrompt() then
+            notify("Ban Prompt", "Prompt fired for " .. tostring(state.selectedPlayer), 3)
+        else
+            notify("Ban Prompt", "BanPrompt unavailable or executor lacks fireproximityprompt.", 4)
+        end
+    end
+})
+
+Tabs.Automation:AddButton({
+    Title = "Claim Daily Reward Now",
+    Description = "Claims the current daily reward if it is ready.",
+    Callback = function()
+        local nextRewardTime = player:FindFirstChild("NextRewardTime")
+        if nextRewardTime and nextRewardTime.Value <= os.time() then
+            pcall(function()
+                ReplicatedStorage.ClaimDailyReward:FireServer()
+            end)
+            notify("Daily Reward", "Claim request sent.", 3)
+        else
+            notify("Daily Reward", "Not ready yet.", 3)
+        end
+    end
+})
+
+Tabs.Automation:AddButton({
+    Title = "Claim Free Pack Now",
+    Description = "Claims the free pack if it is available and you are in the group.",
+    Callback = function()
+        local claimed = player:FindFirstChild("FreePackClaimed")
+        local timer = player:FindFirstChild("FreePackTime")
+        if claimed and claimed.Value then
+            notify("Free Pack", "Already claimed.", 3)
+            return
+        end
+        if timer and timer.Value > 0 then
+            notify("Free Pack", "Not ready yet.", 3)
+            return
+        end
+        pcall(function()
+            ReplicatedStorage.ClaimFreePack:FireServer()
+        end)
+        notify("Free Pack", "Claim request sent.", 3)
+    end
+})
+
+Tabs.Automation:AddToggle("AutoClaimDailyToggle", {
+    Title = "Auto Claim Daily Reward",
+    Description = "Claims when the timer reaches zero.",
+    Default = false
+}):OnChanged(function(value)
+    state.autoClaimDaily = value
+    updateAutomationParagraph()
+end)
+
+Tabs.Automation:AddToggle("AutoClaimFreePackToggle", {
+    Title = "Auto Claim Free Pack",
+    Description = "Claims when the pack becomes available.",
+    Default = false
+}):OnChanged(function(value)
+    state.autoClaimFreePack = value
+    updateAutomationParagraph()
+end)
+
+Tabs.Automation:AddToggle("AutoMoneyButtonsToggle", {
+    Title = "Auto Touch Money Buttons",
+    Description = "Cycles through the physical money buttons.",
+    Default = false
+}):OnChanged(function(value)
+    state.autoMoneyButtons = value
+    updateAutomationParagraph()
+end)
+
+Tabs.Settings:AddToggle("NoclipToggle", {
+    Title = "Noclip",
+    Description = "Disables collisions on your character.",
+    Default = false
+}):OnChanged(function(value)
+    state.noclip = value
+end)
+
+Tabs.Settings:AddButton({
+    Title = "Refresh Player List",
+    Description = "Rescans the server player list.",
+    Callback = function()
+        refreshPlayerDropdown()
+        notify("Players", "Player list refreshed.", 3)
+    end
+})
+
+Window:SetOnClose(function()
+    scriptAlive = false
+    state.moneyMagnet = false
+    state.autoClaimDaily = false
+    state.autoClaimFreePack = false
+    state.autoMoneyButtons = false
+    state.autoEquipSelectedTool = false
+    stopLoop()
+end)
+
+RunService.Stepped:Connect(function()
+    if not state.noclip then
+        return
+    end
+
+    local model = player.Character
+    if not model then
+        return
+    end
+
+    for _, child in ipairs(model:GetDescendants()) do
+        if child:IsA("BasePart") then
+            child.CanCollide = false
+        end
+    end
+end)
+
+player.CharacterAdded:Connect(function(newChar)
+    if not scriptAlive then
+        return
+    end
+
+    character = newChar
+    newChar:WaitForChild("HumanoidRootPart")
+    task.wait(0.4)
+
+    if state.moneyMagnet then
+        startLoop()
+    end
+    if state.autoEquipSelectedTool then
+        equipPreferredTool()
+    end
+end)
+
+Players.PlayerAdded:Connect(function()
+    task.wait(0.5)
+    refreshPlayerDropdown()
+end)
+
+Players.PlayerRemoving:Connect(function()
+    task.wait(0.2)
+    refreshPlayerDropdown()
+end)
+
+task.spawn(function()
+    while scriptAlive do
+        updateStatsParagraph()
+        updateInventoryParagraph()
+        updateAutomationParagraph()
+
+        if state.autoClaimDaily then
+            local nextRewardTime = player:FindFirstChild("NextRewardTime")
+            if nextRewardTime and nextRewardTime.Value <= os.time() then
+                pcall(function()
+                    ReplicatedStorage.ClaimDailyReward:FireServer()
+                end)
+            end
+        end
+
+        if state.autoClaimFreePack then
+            local claimed = player:FindFirstChild("FreePackClaimed")
+            local timer = player:FindFirstChild("FreePackTime")
+            if claimed and not claimed.Value and timer and timer.Value <= 0 then
+                pcall(function()
+                    ReplicatedStorage.ClaimFreePack:FireServer()
+                end)
+            end
+        end
+
+        if state.autoMoneyButtons then
+            for i = 1, 7 do
+                if not scriptAlive or not state.autoMoneyButtons then
+                    break
+                end
+                local part = getButtonPart("ButtonsMoney", "Button" .. i)
+                if part then
+                    touchPart(part)
+                    task.wait(0.12)
+                end
+            end
+        end
+
+        if state.autoEquipSelectedTool then
+            equipPreferredTool()
+        end
+
+        task.wait(1)
+    end
+end)
+
+refreshMoneyParts()
+refreshPlayerDropdown()
+updateStatsParagraph()
+updateInventoryParagraph()
+updateAutomationParagraph()
+
+SaveManager:SetLibrary(Fluent)
+InterfaceManager:SetLibrary(Fluent)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({})
+InterfaceManager:SetFolder("FluentScriptHub")
+SaveManager:SetFolder("FluentScriptHub/specific-game")
+InterfaceManager:BuildInterfaceSection(Tabs.Settings)
+SaveManager:BuildConfigSection(Tabs.Settings)
+
+Window:SelectTab(1)
+SaveManager:LoadAutoloadConfig()
+
+notify("Mango Hub", "Ban or Be Banned loaded.", 4)
+print("[Mango Hub] Ban or Be Banned loaded successfully!")

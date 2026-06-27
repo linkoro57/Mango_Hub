@@ -1,0 +1,208 @@
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+player:WaitForChild("PlayerGui")
+if not player.Character then
+    player.CharacterAdded:Wait()
+end
+
+local HUB_BASES = {
+    "https://raw.githubusercontent.com/linkoro57/Mango_Hub/main/",
+    "https://raw.githubusercontent.com/linkoro57/linko_hub/main/",
+}
+
+local task = type(task) == "table" and task or {}
+if type(task.wait) ~= "function" then
+    task.wait = wait
+end
+if type(task.spawn) ~= "function" then
+    task.spawn = function(callback, ...)
+    local args = { ... }
+    return spawn(function()
+        callback(unpack(args))
+    end)
+    end
+end
+if type(task.delay) ~= "function" then
+    task.delay = function(delayTime, callback, ...)
+    local args = { ... }
+    return spawn(function()
+        wait(delayTime)
+        callback(unpack(args))
+    end)
+    end
+end
+
+local TARGETS = {
+    [124473577469410] = {
+        name = "Be a Lucky Block",
+        path = "be-a-lucky-block",
+    },
+    [18667984660] = {
+        name = "Flex Your FPS And Ping",
+        path = "flex-your-fps-and-your-ping",
+    },
+    [96017656548489] = {
+        name = "Ban or Get Banned",
+        path = "ban-or-be-banned",
+    },
+    [79268393072444] = {
+        name = "Sell Lemons",
+        path = "sell-lemons",
+    },
+    [95082159892680] = {
+        name = "+1 Speed Keyboard Escape",
+        path = "plus-one-speed-keyboard-escape",
+    },
+    [88829149289682] = {
+        name = "Jump Brainrot",
+        path = "jump-brainrot",
+    },
+}
+
+local function getLoader()
+    if type(loadstring) == "function" then
+        return loadstring
+    end
+    if type(load) == "function" then
+        return load
+    end
+    return nil
+end
+
+local function httpRequest(url)
+    local ok, result = pcall(function()
+        return game:HttpGet(url, true)
+    end)
+    if ok and type(result) == "string" and result ~= "" then
+        return true, result
+    end
+
+    local synTable = rawget(_G, "syn")
+    local fluxusTable = rawget(_G, "fluxus")
+    local requestImpl = rawget(_G, "request")
+        or rawget(_G, "http_request")
+        or rawget(_G, "http")
+        or rawget(_G, "requestfunc")
+        or (type(synTable) == "table" and synTable.request)
+        or (type(fluxusTable) == "table" and fluxusTable.request)
+
+    if type(requestImpl) ~= "function" then
+        return false, result
+    end
+
+    local requestOk, response = pcall(requestImpl, {
+        Url = url,
+        Method = "GET",
+    })
+
+    if not requestOk or type(response) ~= "table" then
+        return false, response
+    end
+
+    local body = response.Body or response.body
+    if type(body) == "string" and body ~= "" then
+        return true, body
+    end
+
+    return false, body or response.StatusMessage or "empty response"
+end
+
+local function runRemoteScript(path, label)
+    local loader = getLoader()
+    if type(loader) ~= "function" then
+        warn("[Mango Hub] Your executor does not support loadstring/load.")
+        return
+    end
+
+    local fetchOk = false
+    local scriptSource
+    local source
+    for _, base in ipairs(HUB_BASES) do
+        source = base .. path
+        local ok, fetched = httpRequest(source)
+        if ok and type(fetched) == "string" and fetched ~= "" then
+            fetchOk = true
+            scriptSource = fetched
+            break
+        end
+        scriptSource = fetched
+    end
+
+    if not fetchOk or type(scriptSource) ~= "string" or scriptSource == "" then
+        warn(string.format("[Mango Hub] Failed to download %s (%s): %s", label, source, tostring(scriptSource)))
+        return
+    end
+
+    local chunk, compileErr = loader(scriptSource)
+    if type(chunk) ~= "function" then
+        warn(string.format("[Mango Hub] Failed to compile %s (%s): %s", label, source, tostring(compileErr)))
+        return
+    end
+
+    local ok, err = xpcall(chunk, function(message)
+        if type(debug) == "table" and type(debug.traceback) == "function" then
+            return debug.traceback(tostring(message), 2)
+        end
+        return tostring(message)
+    end)
+
+    if not ok then
+        warn(string.format("[Mango Hub] Failed to load %s (%s): %s", label, source, tostring(err)))
+    end
+end
+
+local function preloadSharedModules()
+    if rawget(_G, "__MangoHubUIFactory") then
+        return
+    end
+
+    local loader = getLoader()
+    if type(loader) ~= "function" then
+        return
+    end
+
+    local source
+    local lastErr
+    for _, base in ipairs(HUB_BASES) do
+        local ok, fetched = httpRequest(base .. "mango-ui")
+        if ok and type(fetched) == "string" and fetched ~= "" then
+            source = fetched
+            break
+        end
+        lastErr = fetched
+    end
+
+    if type(source) ~= "string" or source == "" then
+        warn("[Mango Hub] Failed to preload shared UI: " .. tostring(lastErr))
+        return
+    end
+
+    local chunk, compileErr = loader(source)
+    if type(chunk) ~= "function" then
+        warn("[Mango Hub] Failed to compile shared UI: " .. tostring(compileErr))
+        return
+    end
+
+    local ok, factory = pcall(chunk)
+    if ok and type(factory) == "table" then
+        _G.__MangoHubUIFactory = factory
+    else
+        warn("[Mango Hub] Failed to initialize shared UI: " .. tostring(factory))
+    end
+end
+
+local placeId = game.PlaceId
+local target = TARGETS[placeId]
+
+if target then
+    print(string.format("[Mango Hub] Loading %s...", target.name))
+    preloadSharedModules()
+    runRemoteScript(target.path, target.name)
+else
+    player:Kick("This game is not supported")
+end
